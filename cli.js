@@ -7,6 +7,7 @@ import path from 'path';
 import os from 'os';
 import fs from 'fs';
 import { exec, spawn } from 'child_process';
+import { fileURLToPath } from 'url';
 
 const WS_URL = 'ws://localhost:3000?type=cli';
 const REPORT_WIDTH = 76;
@@ -335,8 +336,10 @@ function initWebSocket() {
 function startBackendAndReconnect() {
   console.log(chalk.gray('  Starting backend server...'));
   
-  // Find project root to locate backend/server.js
-  const backendPath = path.join(CWD, 'backend', 'server.js');
+  // Find installation root to locate backend/server.js
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = path.dirname(__filename);
+  const backendPath = path.join(__dirname, 'backend', 'server.js');
   
   const child = spawn('node', [backendPath], {
     detached: false,
