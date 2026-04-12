@@ -16,7 +16,7 @@ call npm install
 cd ..
 
 echo 4/4 Activating global command...
-call npm install -g .
+call npm link --force
 
 echo Installation complete! You can now start the agent from anywhere by typing: openbrain
 pause
