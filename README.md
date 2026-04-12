@@ -54,7 +54,7 @@ Open [ChatGPT](https://chatgpt.com), [Claude](https://claude.ai), or [Gemini](ht
 ### 5. Start the CLI
 
 ```bash
-node cli.js
+openbrain
 ```
 
 ### 6. Ask anything

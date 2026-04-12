@@ -15,7 +15,8 @@ const SHELL_TIMEOUT_MS = 20000;
 // ─── Detect project context ───
 const CWD = process.cwd();
 const PROJECT_NAME = path.basename(CWD);
-const USER = os.userInfo().username || 'user';
+let USER = 'user';
+try { USER = os.userInfo().username || 'user'; } catch (e) {}
 let shellCwd = CWD;
 let lastShellCommand = '';
 let lastShellOutput = '';
