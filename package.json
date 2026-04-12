@@ -1,0 +1,16 @@
+{
+  "name": "open-brain",
+  "version": "1.0.0",
+  "description": "Terminal-based AI agent using browser AIs as the brain",
+  "type": "module",
+  "bin": {
+    "openbrain": "./cli.js"
+  },
+  "scripts": {
+    "start": "node cli.js"
+  },
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "ws": "^8.16.0"
+  }
+}

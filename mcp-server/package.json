@@ -1,0 +1,10 @@
+{
+  "name": "custom-mcp-server",
+  "version": "1.0.0",
+  "description": "Custom MCP server with shell and file tools",
+  "main": "index.js",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}
