@@ -77,7 +77,7 @@ function printBanner() {
   console.log();
   console.log(chalk.gray('  Type a natural-language request, or run shell commands like `cd`, `ls`, `pwd`, `git status`.'));
   console.log(chalk.gray('  Prefix with ') + chalk.yellow('!') + chalk.gray(' to force local shell execution.'));
-  console.log(chalk.gray('  Commands: ') + chalk.yellow('/clear') + chalk.gray('  ') + chalk.yellow('/exit') + chalk.gray('  ') + chalk.yellow('/help'));
+  console.log(chalk.gray('  Commands: ') + chalk.yellow('/clear') + chalk.gray('  ') + chalk.yellow('/exit') + chalk.gray('  ') + chalk.yellow('/help') + chalk.gray('  ') + chalk.yellow('/new') + chalk.gray('  ') + chalk.yellow('/new ai <url>') + chalk.gray('  ') + chalk.yellow('/agents'));
   console.log(chalk.gray('  ' + '─'.repeat(REPORT_WIDTH)));
   console.log();
 }
@@ -104,15 +104,45 @@ function printToolDone(preview, isError) {
   }
 }
 
-function cleanAndPrintReasoning(text) {
-  if (!text) return;
-  const cleaned = text
-    .replace(/MCP_ACTION:\s*\{[\s\S]*?\}/g, '')
-    .replace(/```json\s*\n?MCP_ACTION[\s\S]*?```/g, '')
+// ─── Balanced-brace MCP_ACTION stripper ───
+function stripMcpActions(text) {
+  let result = '';
+  let i = 0;
+  while (i < text.length) {
+    const idx = text.indexOf('MCP_ACTION:', i);
+    if (idx === -1) { result += text.slice(i); break; }
+    result += text.slice(i, idx);
+    const braceStart = text.indexOf('{', idx);
+    if (braceStart === -1) { i = idx + 11; continue; }
+    let depth = 0, inStr = false, esc = false, end = -1;
+    for (let j = braceStart; j < text.length; j++) {
+      const c = text[j];
+      if (esc) { esc = false; continue; }
+      if (c === '\\') { esc = true; continue; }
+      if (c === '"') { inStr = !inStr; continue; }
+      if (!inStr) {
+        if (c === '{') depth++;
+        if (c === '}') { depth--; if (depth === 0) { end = j; break; } }
+      }
+    }
+    i = end !== -1 ? end + 1 : braceStart + 1;
+  }
+  return result;
+}
+
+function cleanProtocolNoise(text) {
+  return stripMcpActions(text)
+    .replace(/```(?:json)?\s*\n?MCP_ACTION[\s\S]*?```/g, '')
     .replace(/\[TOOL RESULT:[\s\S]*?\[END TOOL RESULT\]/g, '')
-    .replace(/Continue your analysis\..*$/gm, '')
+    .replace(/Continue your (?:analysis|reasoning)\..*$/gm, '')
+    .replace(/Output another MCP_ACTION.*$/gm, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+function cleanAndPrintReasoning(text) {
+  if (!text) return;
+  const cleaned = cleanProtocolNoise(text);
 
   if (cleaned) {
     console.log();
@@ -185,21 +215,17 @@ function printFinalReport(text, toolCount) {
 function printHelp() {
   console.log();
   console.log(chalk.bold.white('  Available commands:'));
-  console.log(chalk.yellow('    /clear') + chalk.gray('   — Clear terminal and show banner'));
-  console.log(chalk.yellow('    /exit') + chalk.gray('    — Quit the CLI'));
-  console.log(chalk.yellow('    /help') + chalk.gray('    — Show this help'));
+  console.log(chalk.yellow('    /clear') + chalk.gray('          — Clear terminal and show banner'));
+  console.log(chalk.yellow('    /exit') + chalk.gray('           — Quit the CLI'));
+  console.log(chalk.yellow('    /help') + chalk.gray('           — Show this help'));
+  console.log(chalk.yellow('    /new') + chalk.gray('            — Reset the current session (fresh conversation)'));
+  console.log(chalk.yellow('    /new ai <url>') + chalk.gray('   — Open a new AI tab and register it as an agent'));
+  console.log(chalk.yellow('    /agents') + chalk.gray('         — List all active browser agents'));
   console.log();
   console.log(chalk.bold.white('  Shell mode:'));
   console.log(chalk.gray('    cd <dir>') + chalk.gray('   — Change the local working directory'));
   console.log(chalk.gray('    pwd, ls, cat, tree, git status, grep, find, wc'));
   console.log(chalk.gray('    !<cmd>') + chalk.gray('     — Force a command to run locally in your shell'));
-  console.log();
-  console.log(chalk.bold.white('  How it works:'));
-  console.log(chalk.gray('    1. Type a request like "analyze this project"'));
-  console.log(chalk.gray('    2. The browser AI reads your request'));
-  console.log(chalk.gray('    3. It calls tools (ls, read_file, grep, etc.) autonomously'));
-  console.log(chalk.gray('    4. Each tool result feeds back into the AI'));
-  console.log(chalk.gray('    5. The AI continues until it has a full answer'));
   console.log();
 }
 
@@ -457,14 +483,8 @@ function handleWsMessage(msg) {
       isStreamingReport = false;
       const finalText = msg.text || reportBuffer;
       reportBuffer = '';
-      // Strip any raw MCP_ACTION lines from the report
-      const cleaned = finalText
-        .replace(/MCP_ACTION:\s*\{[\s\S]*?\}/g, '')
-        .replace(/```json\s*\n?MCP_ACTION[\s\S]*?```/g, '')
-        .replace(/\[TOOL RESULT:[\s\S]*?\[END TOOL RESULT\]/g, '')
-        .replace(/Continue your analysis\..*$/gm, '')
-        .replace(/\n{3,}/g, '\n\n')
-        .trim();
+      // Strip any raw MCP_ACTION lines from the report using balanced-brace logic
+      const cleaned = cleanProtocolNoise(finalText);
       printFinalReport(cleaned, toolCallCount);
       toolCallCount = 0;
       isWaiting = false;
@@ -477,13 +497,7 @@ function handleWsMessage(msg) {
       if (reportBuffer) {
         stopSpinner();
         isStreamingReport = false;
-        const cleaned = reportBuffer
-          .replace(/MCP_ACTION:\s*\{[\s\S]*?\}/g, '')
-          .replace(/```json\s*\n?MCP_ACTION[\s\S]*?```/g, '')
-          .replace(/\[TOOL RESULT:[\s\S]*?\[END TOOL RESULT\]/g, '')
-          .replace(/Continue your analysis\..*$/gm, '')
-          .replace(/\n{3,}/g, '\n\n')
-          .trim();
+        const cleaned = cleanProtocolNoise(reportBuffer);
         printFinalReport(cleaned, toolCallCount);
         reportBuffer = '';
       } else {
@@ -520,6 +534,34 @@ rl.on('line', async (line) => {
   if (text === '/exit' || text === 'exit') { rl.close(); return; }
   if (text === '/clear') { printBanner(); rl.prompt(); return; }
   if (text === '/help') { printHelp(); rl.prompt(); return; }
+
+  // ── /new — reset session ──
+  if (text === '/new') {
+    ws.send(JSON.stringify({ type: 'NEW_SESSION' }));
+    console.log(chalk.cyan('  🔄 Session reset requested...'));
+    rl.prompt();
+    return;
+  }
+
+  // ── /new ai <url> — open new AI tab ──
+  if (text.startsWith('/new ai ')) {
+    const url = text.slice(8).trim();
+    if (!url) {
+      console.log(chalk.red('  Usage: /new ai <url>  (e.g. /new ai https://claude.ai)'));
+    } else {
+      ws.send(JSON.stringify({ type: 'OPEN_TAB', url }));
+      console.log(chalk.cyan(`  🆕 Opening new AI tab: ${url}`));
+    }
+    rl.prompt();
+    return;
+  }
+
+  // ── /agents — list active agents ──
+  if (text === '/agents') {
+    ws.send(JSON.stringify({ type: 'LIST_AGENTS' }));
+    rl.prompt();
+    return;
+  }
 
   if (await handleLocalShellInput(text)) {
     rl.setPrompt(getPrompt());

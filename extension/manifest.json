@@ -12,6 +12,9 @@
     "https://chat.openai.com/*",
     "https://claude.ai/*",
     "https://gemini.google.com/*",
+    "https://www.perplexity.ai/*",
+    "https://x.com/*",
+    "https://z.ai/*",
     "http://localhost:3000/*"
   ],
   "action": {
@@ -26,7 +29,10 @@
         "https://chatgpt.com/*",
         "https://chat.openai.com/*",
         "https://claude.ai/*",
-        "https://gemini.google.com/*"
+        "https://gemini.google.com/*",
+        "https://www.perplexity.ai/*",
+        "https://x.com/*",
+        "https://z.ai/*"
       ],
       "js": ["content.js"],
       "run_at": "document_start"
@@ -36,7 +42,10 @@
         "https://chatgpt.com/*",
         "https://chat.openai.com/*",
         "https://claude.ai/*",
-        "https://gemini.google.com/*"
+        "https://gemini.google.com/*",
+        "https://www.perplexity.ai/*",
+        "https://x.com/*",
+        "https://z.ai/*"
       ],
       "js": ["injected.js"],
       "run_at": "document_start",

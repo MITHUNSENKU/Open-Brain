@@ -7,6 +7,7 @@ import { dirname, join } from 'path';
 import { exec } from 'child_process';
 import { MyMcpClient } from "./mcp-client.js";
 import fs from 'fs';
+import os from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -61,23 +62,38 @@ const mcpClient = new MyMcpClient();
 const wss = new WebSocketServer({ noServer: true });
 
 let cliSocket = null;
-const extensionSockets = new Set();
-let activeExtensionSocket = null; // The most recently active/connected extension
+const extensionSockets = new Map(); // agentId -> ws
+let activeAgentId = null;
 
-// ─── Agentic Session State ───
-// States: IDLE | WAITING_FOR_AI | TOOL_RUNNING
-let session = {
-  state: 'IDLE',
-  toolCallCount: 0,
-  fullReport: '',   // accumulates ALL reasoning across turns
-  cwd: process.cwd(),
-  project: '',
-  shellCwd: process.cwd(),
-  shellMetadata: {},
-  pendingTool: null,
-  approvedTools: new Set(),
-  approvalTimer: null,
-};
+// ─── Multi-Session State ───
+// Each agent (browser tab) gets its own session
+const sessions = new Map(); // agentId -> session object
+
+function createSession(agentId) {
+  return {
+    agentId,
+    state: 'IDLE',
+    toolCallCount: 0,
+    fullReport: '',
+    bufferFile: null,  // file-descriptor buffer for streaming data
+    cwd: process.cwd(),
+    project: '',
+    shellCwd: process.cwd(),
+    shellMetadata: {},
+    pendingTool: null,
+    approvedTools: new Set(),
+    approvalTimer: null,
+    url: '',
+  };
+}
+
+// Convenience: get the active session
+function getSession(agentId) {
+  if (!agentId) agentId = activeAgentId;
+  if (!agentId) return null;
+  if (!sessions.has(agentId)) sessions.set(agentId, createSession(agentId));
+  return sessions.get(agentId);
+}
 
 function sendToCli(msg) {
   if (cliSocket?.readyState === 1) {
@@ -85,17 +101,19 @@ function sendToCli(msg) {
   }
 }
 
-function sendToExtension(msg) {
-  if (activeExtensionSocket?.readyState === 1) {
-    activeExtensionSocket.send(JSON.stringify(msg));
-    log(chalk.cyan(`[Relay] Message sent to extension: ${msg.type}`));
+function sendToExtension(msg, agentId) {
+  const targetId = agentId || activeAgentId;
+  const ws = extensionSockets.get(targetId);
+  if (ws?.readyState === 1) {
+    ws.send(JSON.stringify(msg));
+    log(chalk.cyan(`[Relay] Message sent to agent ${targetId}: ${msg.type}`));
   } else {
-    // Try other available sockets if the active one failed
-    for (const ws of extensionSockets) {
-      if (ws.readyState === 1) {
-        activeExtensionSocket = ws;
-        ws.send(JSON.stringify(msg));
-        log(chalk.cyan(`[Relay] Message sent to alternate extension: ${msg.type}`));
+    // Try any available socket as fallback
+    for (const [id, sock] of extensionSockets) {
+      if (sock.readyState === 1) {
+        activeAgentId = id;
+        sock.send(JSON.stringify(msg));
+        log(chalk.cyan(`[Relay] Message sent to fallback agent ${id}: ${msg.type}`));
         return;
       }
     }
@@ -103,36 +121,98 @@ function sendToExtension(msg) {
   }
 }
 
-function resetSession() {
-  if (session.approvalTimer) {
-    clearTimeout(session.approvalTimer);
-  }
-  session = {
-    state: 'IDLE',
-    toolCallCount: 0,
-    fullReport: '',
-    cwd: session.cwd,
-    project: session.project,
-    shellCwd: session.shellCwd,
-    shellMetadata: session.shellMetadata,
-    pendingTool: null,
-    approvedTools: session.approvedTools || new Set(),
-    approvalTimer: null,
-  };
+function resetSession(agentId) {
+  const s = getSession(agentId);
+  if (!s) return;
+  if (s.approvalTimer) clearTimeout(s.approvalTimer);
+  closeBuffer(s.bufferFile);
+  s.bufferFile = null;
+  s.state = 'IDLE';
+  s.toolCallCount = 0;
+  s.fullReport = '';
+  s.pendingTool = null;
+  s.approvalTimer = null;
 }
 
 // ─── Strip protocol noise from text before storing ───
+// Uses balanced-brace walk so nested JSON in MCP_ACTION doesn't leak through
+function stripMcpActions(text) {
+  let result = '';
+  let i = 0;
+  while (i < text.length) {
+    const idx = text.indexOf('MCP_ACTION:', i);
+    if (idx === -1) { result += text.slice(i); break; }
+    result += text.slice(i, idx); // keep text before MCP_ACTION
+    // Find the opening brace
+    const braceStart = text.indexOf('{', idx);
+    if (braceStart === -1) { i = idx + 11; continue; }
+    // Balanced-brace walk to find the true end
+    let depth = 0, inStr = false, esc = false, end = -1;
+    for (let j = braceStart; j < text.length; j++) {
+      const c = text[j];
+      if (esc) { esc = false; continue; }
+      if (c === '\\') { esc = true; continue; }
+      if (c === '"') { inStr = !inStr; continue; }
+      if (!inStr) {
+        if (c === '{') depth++;
+        if (c === '}') { depth--; if (depth === 0) { end = j; break; } }
+      }
+    }
+    i = end !== -1 ? end + 1 : braceStart + 1;
+  }
+  return result;
+}
+
 function cleanText(text) {
-  return text
-    .replace(/MCP_ACTION:\s*\{[\s\S]*?\}/g, '')
-    .replace(/\[TOOL RESULT:[\s\S]*?\[END TOOL RESULT\]/g, '')
-    .replace(/Continue your analysis\..*?(?:\n|$)/g, '')
-    .replace(/If you (?:need|have).*?MCP_ACTION.*?(?:\n|$)/g, '');
+  return stripMcpActions(text)
+    .replace(/\`\`\`(?:json)?\\s*\\n?MCP_ACTION[\\s\\S]*?\`\`\`/g, '')
+    .replace(/\\[TOOL RESULT:[\\s\\S]*?\\[END TOOL RESULT\\]/g, '')
+    .replace(/Continue your (?:analysis|reasoning)\\..*?(?:\\n|$)/g, '')
+    .replace(/If you (?:need|have).*?MCP_ACTION.*?(?:\\n|$)/g, '')
+    .replace(/Output another MCP_ACTION.*?(?:\\n|$)/g, '')
+    .replace(/\\n{3,}/g, '\\n\\n');
+}
+
+// ─── File-descriptor buffer for browser stream data ───
+function createBufferFile() {
+  const tmpPath = join(os.tmpdir(), `openbrain-buf-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`);
+  const fd = fs.openSync(tmpPath, 'w+');
+  return { fd, path: tmpPath };
+}
+
+function appendToBuffer(bufInfo, text) {
+  if (!bufInfo || bufInfo.fd === null) return;
+  try {
+    fs.writeSync(bufInfo.fd, text);
+  } catch (e) {
+    log(chalk.red(`[Buffer] Write failed: ${e.message}`));
+  }
+}
+
+function readBuffer(bufInfo) {
+  if (!bufInfo || bufInfo.fd === null) return '';
+  try {
+    return fs.readFileSync(bufInfo.path, 'utf-8');
+  } catch (e) {
+    log(chalk.red(`[Buffer] Read failed: ${e.message}`));
+    return '';
+  }
+}
+
+function closeBuffer(bufInfo) {
+  if (!bufInfo) return;
+  try {
+    if (bufInfo.fd !== null) { fs.closeSync(bufInfo.fd); bufInfo.fd = null; }
+    if (fs.existsSync(bufInfo.path)) fs.unlinkSync(bufInfo.path);
+  } catch (e) { /* ignore cleanup errors */ }
 }
 
 // ─── Shared Message Logic (Used by both WS and HTTP) ───
 async function handleExtensionMessage(msg, source = 'WS') {
-  // ── Handle Logs from browser ──
+  const agentId = msg.agentId || activeAgentId;
+  const s = getSession(agentId);
+  if (!s) return;
+
   if (msg.type === "LOG") {
     const { level, text, msg: legacyMsg, tool } = msg;
     const content = text || legacyMsg || '';
@@ -142,70 +222,43 @@ async function handleExtensionMessage(msg, source = 'WS') {
     return;
   }
 
-  // ── AI is streaming text ──
   if (msg.type === "AI_STREAM") {
-    if (session.state !== 'IDLE') {
-      log(chalk.gray(`[Relay] Stream received (${source}, ${msg.text.length} chars)`));
-      const cleaned = cleanText(msg.text);
-      if (cleaned.trim()) {
-        session.fullReport += cleaned;
-      }
-      sendToCli({ type: 'AI_STREAM', text: msg.text });
-    } else {
-      log(chalk.gray(`[Relay] AI_STREAM ignored — session state is '${session.state}'`));
+    if (s.state !== 'IDLE') {
+      // Write raw stream to file descriptor buffer instead of growing a string
+      if (!s.bufferFile) s.bufferFile = createBufferFile();
+      appendToBuffer(s.bufferFile, msg.text);
+      sendToCli({ type: 'AI_STREAM', text: msg.text, agentId });
     }
+    return;
   }
 
-  // ── AI finished a turn ──
-  else if (msg.type === "AI_COMPLETE") {
-    log(chalk.green(`[Relay] AI_COMPLETE received (${source}, turns: ${session.toolCallCount + 1}, state: ${session.state})`));
-    if (session.state === 'TOOL_RUNNING') {
-      // A tool is still running — AI_COMPLETE is premature, ignore it
-      log(chalk.yellow(`[Session] AI_COMPLETE ignored — tool is still running`));
-    } else if (session.state === 'WAITING_FOR_AI') {
-      log(chalk.green(`[Session] Final answer after ${session.toolCallCount} tool calls`));
-      const finalText = session.fullReport;
-      resetSession();
-      sendToCli({ type: 'FINAL_REPORT', text: finalText });
-    } else {
-      log(chalk.gray(`[Session] AI_COMPLETE ignored — session is IDLE`));
+  if (msg.type === "AI_COMPLETE") {
+    log(chalk.green(`[Agent:${agentId}] AI_COMPLETE (state: ${s.state})`));
+    if (s.state === 'WAITING_FOR_AI') {
+      // Read the full buffer from the temp file, clean it, then send
+      const rawBuffer = s.bufferFile ? readBuffer(s.bufferFile) : s.fullReport;
+      const finalText = cleanText(rawBuffer);
+      resetSession(agentId);
+      sendToCli({ type: 'FINAL_REPORT', text: finalText, agentId });
     }
+    return;
   }
 
-  // ── AI wants to call a tool ──
-  else if (msg.type === "MCP_ACTION") {
-    if (session.state === 'IDLE') {
-      log(chalk.yellow(`[Session] MCP_ACTION received but session is IDLE — ignoring (no active request)`));
+  if (msg.type === "MCP_ACTION") {
+    if (s.state === 'IDLE' || s.state === 'TOOL_RUNNING') return;
+    if (s.toolCallCount >= MAX_TOOL_CALLS) {
+      const rawBuffer = s.bufferFile ? readBuffer(s.bufferFile) : s.fullReport;
+      const finalText = cleanText(rawBuffer) || 'Maximum tool iterations reached.';
+      resetSession(agentId);
+      sendToCli({ type: 'FINAL_REPORT', text: finalText, agentId });
       return;
     }
-
-    if (session.state === 'TOOL_RUNNING') {
-      log(chalk.yellow(`[Session] MCP_ACTION for '${msg.tool}' received while TOOL_RUNNING — likely duplicate, ignoring`));
-      return;
-    }
-
-    if (session.toolCallCount >= MAX_TOOL_CALLS) {
-      log(chalk.red(`[Session] Hit max tool calls (${MAX_TOOL_CALLS})`));
-      const finalText = session.fullReport || 'Maximum tool iterations reached.';
-      resetSession();
-      sendToCli({ type: 'FINAL_REPORT', text: finalText });
-      return;
-    }
-
-    session.pendingTool = {
-      tool: msg.tool,
-      args: msg.args,
-      source,
-    };
-    
-    // Check if tool was previously approved for 'remember' state
-    if (session.approvedTools && session.approvedTools.has(msg.tool)) {
-      log(chalk.yellow(`[Tool] Auto-executing (previously approved): ${msg.tool}`));
-      await executePendingTool();
+    s.pendingTool = { tool: msg.tool, args: msg.args, source, agentId };
+    if (s.approvedTools && s.approvedTools.has(msg.tool)) {
+      await executePendingTool(agentId);
     } else {
-      log(chalk.yellow(`[Tool] Requesting approval for: ${msg.tool}`));
-      session.state = 'WAITING_FOR_APPROVAL';
-      sendToCli({ type: 'TOOL_CALL_REQUEST', tool: msg.tool, args: msg.args, source });
+      s.state = 'WAITING_FOR_APPROVAL';
+      sendToCli({ type: 'TOOL_CALL_REQUEST', tool: msg.tool, args: msg.args, source, agentId });
     }
     return;
   }
@@ -219,14 +272,14 @@ function collectDiagnostics(cwd) {
     const tryDone = () => { if (++done === cmds.length) resolve(lines.join('\n')); };
 
     const cmds = [
-      { label: 'cwd',        cmd: 'pwd' },
-      { label: 'ls',         cmd: 'ls -la 2>&1 | head -30' },
-      { label: 'PATH',       cmd: 'echo "PATH=$PATH"' },
-      { label: 'python',     cmd: 'which python3 2>/dev/null || which python 2>/dev/null || echo "(python not found)"' },
-      { label: 'node',       cmd: 'node --version 2>&1' },
-      { label: 'npm',        cmd: 'npm --version 2>&1' },
-      { label: 'disk',       cmd: 'df -h . 2>&1 | tail -1' },
-      { label: 'processes',  cmd: 'ps aux 2>&1 | grep -v grep | grep -E "node|python|npm|server" | head -10' },
+      { label: 'cwd', cmd: 'pwd' },
+      { label: 'ls', cmd: 'ls -la 2>&1 | head -30' },
+      { label: 'PATH', cmd: 'echo "PATH=$PATH"' },
+      { label: 'python', cmd: 'which python3 2>/dev/null || which python 2>/dev/null || echo "(python not found)"' },
+      { label: 'node', cmd: 'node --version 2>&1' },
+      { label: 'npm', cmd: 'npm --version 2>&1' },
+      { label: 'disk', cmd: 'df -h . 2>&1 | tail -1' },
+      { label: 'processes', cmd: 'ps aux 2>&1 | grep -v grep | grep -E "node|python|npm|server" | head -10' },
     ];
 
     for (const { label, cmd } of cmds) {
@@ -239,75 +292,45 @@ function collectDiagnostics(cwd) {
   });
 }
 
-async function executePendingTool() {
-  const pending = session.pendingTool;
+async function executePendingTool(agentId) {
+  agentId = agentId || activeAgentId;
+  const s = getSession(agentId);
+  const pending = s?.pendingTool;
   if (!pending) return;
 
-  session.pendingTool = null;
-  if (session.approvalTimer) {
-    clearTimeout(session.approvalTimer);
-    session.approvalTimer = null;
-  }
-  session.state = 'TOOL_RUNNING';
-  session.toolCallCount++;
+  s.pendingTool = null;
+  if (s.approvalTimer) { clearTimeout(s.approvalTimer); s.approvalTimer = null; }
+  s.state = 'TOOL_RUNNING';
+  s.toolCallCount++;
 
-  log(chalk.yellow(`[Tool #${session.toolCallCount}] ${pending.tool} (${pending.source}) args=${JSON.stringify(pending.args)}`));
-  sendToCli({ type: 'TOOL_CALL_START', tool: pending.tool, args: pending.args, source: pending.source });
-
-  if (pending.tool === 'ask_permission_and_run') {
-    log(chalk.cyan(`[Interactive] Sending interactive command request to CLI...`));
-    session.activeInteractiveTool = pending;
-    sendToCli({ type: 'TOOL_INTERACTIVE_REQUEST', tool: pending.tool, args: pending.args, source: pending.source });
-    return; // Do not call mcpClient
-  }
+  log(chalk.yellow(`[Tool #${s.toolCallCount}] ${pending.tool} args=${JSON.stringify(pending.args)}`));
+  sendToCli({ type: 'TOOL_CALL_START', tool: pending.tool, args: pending.args, agentId });
 
   try {
-    log(chalk.cyan(`[MCP] Calling tool: ${pending.tool}...`));
     const result = await mcpClient.callTool(pending.tool, pending.args);
-    const resultText = result.content
-      ? result.content.map(c => c.text).join('\n')
-      : JSON.stringify(result);
+    const resultText = result.content ? result.content.map(c => c.text).join('\n') : JSON.stringify(result);
     const isError = result.isError || false;
-
     const preview = resultText.replace(/\n/g, ' ').slice(0, 100) + (resultText.length > 100 ? '...' : '');
-    log(isError ? chalk.red(`[Tool] Error result: ${pending.tool}`) : chalk.green(`[Tool] Done: ${pending.tool} → ${resultText.length} chars`));
-    sendToCli({ type: 'TOOL_CALL_DONE', preview, isError });
 
-    session.state = 'WAITING_FOR_AI';
-    log(chalk.cyan(`[Session] State → WAITING_FOR_AI (tool #${session.toolCallCount} complete)`));
+    sendToCli({ type: 'TOOL_CALL_DONE', preview, isError, agentId });
+    s.state = 'WAITING_FOR_AI';
 
     if (isError) {
-      // Gather diagnostic context so AI can self-heal
-      log(chalk.yellow(`[Recovery] Tool ${pending.tool} returned error — collecting diagnostics...`));
-      sendToCli({ type: 'TOOL_ERROR_RECOVERY', tool: pending.tool, preview });
       let diag = '';
-      try { diag = await collectDiagnostics(session.shellCwd || session.cwd || process.cwd()); } catch (de) { diag = `(diagnostics failed: ${de.message})`; }
-      const enriched =
-        `❌ TOOL ERROR in '${pending.tool}':\n${resultText}\n\n` +
-        `--- DIAGNOSTIC CONTEXT (auto-collected) ---\n${diag}\n` +
-        `--- END DIAGNOSTICS ---\n\n` +
-        `Analyze the error above. Fix and retry with the correct tool call. Do NOT ask the user.`;
-      sendToExtension({ type: 'MCP_RESULT', tool: pending.tool, text: enriched, callNum: session.toolCallCount, isError: true });
+      try { diag = await collectDiagnostics(s.shellCwd || s.cwd || process.cwd()); } catch (de) { diag = `(diagnostics failed: ${de.message})`; }
+      const enriched = `❌ TOOL ERROR in '${pending.tool}':\n${resultText}\n\n--- DIAGNOSTIC CONTEXT ---\n${diag}\n--- END DIAGNOSTICS ---\n\nFix and retry. Do NOT ask the user.`;
+      sendToCli({ type: 'TOOL_ERROR_RECOVERY', tool: pending.tool, preview, agentId });
+      sendToExtension({ type: 'MCP_RESULT', tool: pending.tool, text: enriched, callNum: s.toolCallCount, isError: true }, agentId);
     } else {
-      sendToExtension({ type: 'MCP_RESULT', tool: pending.tool, text: resultText, callNum: session.toolCallCount });
+      sendToExtension({ type: 'MCP_RESULT', tool: pending.tool, text: resultText, callNum: s.toolCallCount }, agentId);
     }
-
   } catch (err) {
-    log(chalk.red(`[Tool] Exception in ${pending.tool}: ${err.message}`));
-    session.state = 'WAITING_FOR_AI';
-    log(chalk.cyan(`[Session] State → WAITING_FOR_AI (exception recovery)`));
-
-    // Gather diagnostics — wrapped so a crash here can't block the MCP_RESULT
+    s.state = 'WAITING_FOR_AI';
     let diag = '';
-    try { diag = await collectDiagnostics(session.shellCwd || session.cwd || process.cwd()); } catch (de) { diag = `(diagnostics failed: ${de.message})`; }
-    const enriched =
-      `❌ EXCEPTION in '${pending.tool}':\n${err.message}\n\n` +
-      `--- DIAGNOSTIC CONTEXT (auto-collected) ---\n${diag}\n` +
-      `--- END DIAGNOSTICS ---\n\n` +
-      `Analyze the error above. Fix and retry with the correct tool call. Do NOT ask the user.`;
-
-    sendToCli({ type: 'TOOL_CALL_DONE', preview: `Error: ${err.message}`, isError: true });
-    sendToExtension({ type: 'MCP_RESULT', tool: pending.tool, text: enriched, callNum: session.toolCallCount, isError: true });
+    try { diag = await collectDiagnostics(s.shellCwd || s.cwd || process.cwd()); } catch (de) { diag = `(diagnostics failed: ${de.message})`; }
+    const enriched = `❌ EXCEPTION in '${pending.tool}':\n${err.message}\n\n--- DIAGNOSTIC CONTEXT ---\n${diag}\n--- END DIAGNOSTICS ---\n\nFix and retry. Do NOT ask the user.`;
+    sendToCli({ type: 'TOOL_CALL_DONE', preview: `Error: ${err.message}`, isError: true, agentId });
+    sendToExtension({ type: 'MCP_RESULT', tool: pending.tool, text: enriched, callNum: s.toolCallCount, isError: true }, agentId);
   }
 }
 
@@ -315,7 +338,8 @@ async function executePendingTool() {
 wss.on("connection", (ws, req) => {
   const params = new URLSearchParams(req.url.replace(/^[^?]*/, ''));
   const type = params.get('type') || 'extension';
-  log(chalk.magenta(`[WS] ${type} connected`));
+  const agentId = params.get('agentId') || `agent-${Date.now()}`;
+  log(chalk.magenta(`[WS] ${type} connected (id: ${agentId})`));
 
   if (type === "cli") {
     cliSocket = ws;
@@ -323,109 +347,131 @@ wss.on("connection", (ws, req) => {
     ws.on("message", async (data) => {
       const msg = JSON.parse(data.toString());
 
-      if (msg.type === "PROMPT") {
-        if (!activeExtensionSocket || activeExtensionSocket.readyState !== 1) {
-          // Check if any extension is alive
-          const alive = [...extensionSockets].find(ws => ws.readyState === 1);
-          if (alive) {
-            activeExtensionSocket = alive;
-          } else {
-            sendToCli({
-              type: 'ERROR',
-              text: 'Browser extension not connected. Open ChatGPT/Claude/Gemini in Chrome with the extension loaded.',
-            });
-            return;
+      // ── /new ai <url> — open a new AI tab ──
+      if (msg.type === "OPEN_TAB") {
+        const newId = `agent-${Date.now()}`;
+        sessions.set(newId, createSession(newId));
+        // Broadcast OPEN_TAB to all connected extensions so one of them opens it
+        for (const [, sock] of extensionSockets) {
+          if (sock.readyState === 1) {
+            sock.send(JSON.stringify({ type: 'OPEN_TAB', url: msg.url, agentId: newId }));
+            break;
           }
         }
+        sendToCli({ type: 'STATUS', text: `🆕 Spawning new agent tab (${newId}) → ${msg.url}` });
+        return;
+      }
 
-        // Store context from CLI
-        session.cwd = msg.cwd || session.cwd;
-        session.project = msg.project || session.project;
-        session.shellCwd = msg.shellCwd || session.shellCwd || session.cwd;
-        session.shellMetadata = msg.shellMetadata || session.shellMetadata || {};
+      // ── /new — reset active session ──
+      if (msg.type === "NEW_SESSION") {
+        const targetId = msg.agentId || activeAgentId;
+        if (targetId) {
+          resetSession(targetId);
+          const ws2 = extensionSockets.get(targetId);
+          if (ws2?.readyState === 1) ws2.send(JSON.stringify({ type: 'CLEAR_CONVERSATION' }));
+        }
+        sendToCli({ type: 'STATUS', text: `🔄 Session reset for agent: ${targetId || 'none'}` });
+        return;
+      }
+
+      // ── /agents — list active agents ──
+      if (msg.type === "LIST_AGENTS") {
+        const list = [...extensionSockets.entries()].map(([id, sock]) => {
+          const s = sessions.get(id);
+          return `• ${id} | ${sock.readyState === 1 ? '🟢 connected' : '🔴 disconnected'} | state: ${s?.state || 'unknown'} | url: ${s?.url || 'unknown'}`;
+        });
+        sendToCli({ type: 'STATUS', text: list.length ? `Active agents:\n${list.join('\n')}` : 'No active agents.' });
+        return;
+      }
+
+      // ── PROMPT ──
+      if (msg.type === "PROMPT") {
+        const targetId = msg.agentId || activeAgentId;
+        const alive = extensionSockets.get(targetId);
+        if (!alive || alive.readyState !== 1) {
+          // fallback to any live socket
+          let found = null;
+          for (const [id, sock] of extensionSockets) {
+            if (sock.readyState === 1) { found = id; break; }
+          }
+          if (!found) {
+            sendToCli({ type: 'ERROR', text: 'No browser extension connected. Open ChatGPT/Claude/Gemini in Chrome.' });
+            return;
+          }
+          activeAgentId = found;
+        } else {
+          activeAgentId = targetId;
+        }
+
+        const s = getSession(activeAgentId);
+        s.cwd = msg.cwd || s.cwd;
+        s.project = msg.project || s.project;
+        s.shellCwd = msg.shellCwd || s.shellCwd || s.cwd;
+        s.shellMetadata = msg.shellMetadata || s.shellMetadata || {};
+        s.state = 'WAITING_FOR_AI';
+        s.toolCallCount = 0;
+        s.fullReport = '';
+        // Clean up old buffer and create fresh one
+        closeBuffer(s.bufferFile);
+        s.bufferFile = null;
+        s.pendingTool = null;
 
         const shellContext = [
-          `[Working directory: ${session.cwd}]`,
-          `[Shell cwd: ${session.shellCwd}]`,
-          `[Project: ${session.project}]`,
-          session.shellMetadata?.lastShellCommand ? `[Last shell command: ${session.shellMetadata.lastShellCommand}]` : null,
-          session.shellMetadata?.lastShellOutput ? `[Last shell output: ${session.shellMetadata.lastShellOutput}]` : null,
+          `[Working directory: ${s.cwd}]`,
+          `[Shell cwd: ${s.shellCwd}]`,
+          `[Project: ${s.project}]`,
+          s.shellMetadata?.lastShellCommand ? `[Last shell command: ${s.shellMetadata.lastShellCommand}]` : null,
+          s.shellMetadata?.lastShellOutput ? `[Last shell output: ${s.shellMetadata.lastShellOutput}]` : null,
         ].filter(Boolean).join('\n');
 
         const contextualPrompt = `${shellContext}\n\n${msg.text}`;
-
-        log(chalk.blue(`[CLI→AI] "${msg.text.slice(0, 80)}..."`));
-        session = {
-          state: 'WAITING_FOR_AI',
-          toolCallCount: 0,
-          fullReport: '',
-          cwd: session.cwd,
-          project: session.project,
-          shellCwd: session.shellCwd,
-          shellMetadata: session.shellMetadata,
-          pendingTool: null,
-          approvedTools: session.approvedTools || new Set(),
-          approvalTimer: null,
-        };
-
+        log(chalk.blue(`[CLI→Agent:${activeAgentId}] "${msg.text.slice(0, 80)}..."`));
         sendToCli({ type: 'AI_THINKING', text: 'AI is thinking...' });
-        sendToExtension({ type: 'SEND_PROMPT', text: contextualPrompt });
-      } else if (msg.type === "TOOL_APPROVAL") {
-        if (session.state !== 'WAITING_FOR_APPROVAL' || !session.pendingTool) {
-          log(chalk.yellow(`[Approval] Ignored unexpected approval message`));
-          return;
-        }
+        sendToExtension({ type: 'SEND_PROMPT', text: contextualPrompt }, activeAgentId);
+      }
 
+      // ── TOOL_APPROVAL ──
+      else if (msg.type === "TOOL_APPROVAL") {
+        const tid = msg.agentId || activeAgentId;
+        const s = getSession(tid);
+        if (!s || s.state !== 'WAITING_FOR_APPROVAL' || !s.pendingTool) return;
         if (msg.approve) {
-          if (msg.remember && session.pendingTool?.tool) {
-            session.approvedTools.add(session.pendingTool.tool);
-            log(chalk.green(`[Approval] Remembering approval for tool: ${session.pendingTool.tool}`));
-          }
-          log(chalk.green(`[Approval] Tool approved by user`));
-          await executePendingTool();
+          if (msg.remember && s.pendingTool?.tool) s.approvedTools.add(s.pendingTool.tool);
+          await executePendingTool(tid);
         } else {
-          // Reject
-          session.state = 'WAITING_FOR_AI';
-          sendToExtension({
-            type: 'MCP_RESULT',
-            tool: session.pendingTool.tool,
-            text: `Error: tool call denied by user`,
-            callNum: session.toolCallCount,
-            isError: true,
-          });
-          session.pendingTool = null;
+          s.state = 'WAITING_FOR_AI';
+          sendToExtension({ type: 'MCP_RESULT', tool: s.pendingTool.tool, text: 'Error: tool call denied by user', callNum: s.toolCallCount, isError: true }, tid);
+          s.pendingTool = null;
         }
-      } else if (msg.type === "TOOL_INTERACTIVE_RESPONSE") {
-        if (session.state !== 'TOOL_RUNNING' || !session.activeInteractiveTool) return;
-        const pending = session.activeInteractiveTool;
-        session.activeInteractiveTool = null;
-        
+      }
+
+      // ── TOOL_INTERACTIVE_RESPONSE ──
+      else if (msg.type === "TOOL_INTERACTIVE_RESPONSE") {
+        const tid = msg.agentId || activeAgentId;
+        const s = getSession(tid);
+        if (!s || !s.activeInteractiveTool) return;
+        const pending = s.activeInteractiveTool;
+        s.activeInteractiveTool = null;
         const preview = msg.output.replace(/\n/g, ' ').slice(0, 100);
-        log(msg.success ? chalk.green(`[Interactive] Done: ${preview}`) : chalk.red(`[Interactive] Failed: ${preview}`));
-        sendToCli({ type: 'TOOL_CALL_DONE', preview, isError: !msg.success });
-        
-        session.state = 'WAITING_FOR_AI';
-        sendToExtension({ type: 'MCP_RESULT', tool: pending.tool, text: msg.output, callNum: session.toolCallCount, isError: !msg.success });
+        sendToCli({ type: 'TOOL_CALL_DONE', preview, isError: !msg.success, agentId: tid });
+        s.state = 'WAITING_FOR_AI';
+        sendToExtension({ type: 'MCP_RESULT', tool: pending.tool, text: msg.output, callNum: s.toolCallCount, isError: !msg.success }, tid);
       }
     });
 
-    ws.on("close", () => {
-      cliSocket = null;
-      log(chalk.magenta("[WS] CLI disconnected"));
-    });
+    ws.on("close", () => { cliSocket = null; log(chalk.magenta("[WS] CLI disconnected")); });
 
   } else {
-    // Extension connection
-    extensionSockets.add(ws);
-    activeExtensionSocket = ws;
+    // Extension connection — register by agentId
+    extensionSockets.set(agentId, ws);
+    activeAgentId = agentId;
+    if (!sessions.has(agentId)) sessions.set(agentId, createSession(agentId));
 
     ws.on("message", async (data) => {
-      const dataStr = data.toString();
-      // Whenever we get a message from an extension, mark it as active
-      if (type === "extension") activeExtensionSocket = ws;
-
       try {
-        const msg = JSON.parse(dataStr);
+        const msg = JSON.parse(data.toString());
+        msg.agentId = agentId; // stamp every message with its origin
+        if (msg.url) sessions.get(agentId).url = msg.url;
         await handleExtensionMessage(msg, 'WS');
       } catch (e) {
         log(chalk.red(`[WS] Error handling message: ${e.message}`));
@@ -433,11 +479,11 @@ wss.on("connection", (ws, req) => {
     });
 
     ws.on("close", () => {
-      extensionSockets.delete(ws);
-      if (activeExtensionSocket === ws) {
-        activeExtensionSocket = [...extensionSockets].find(w => w.readyState === 1) || null;
+      extensionSockets.delete(agentId);
+      if (activeAgentId === agentId) {
+        activeAgentId = [...extensionSockets.keys()].find(id => extensionSockets.get(id).readyState === 1) || null;
       }
-      log(chalk.magenta("[WS] Extension disconnected"));
+      log(chalk.magenta(`[WS] Agent ${agentId} disconnected`));
     });
   }
 });

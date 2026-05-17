@@ -1,5 +1,5 @@
 // Extension background service worker
-// Handles popup checks and legacy relay; main agentic loop is in content.js via WebSocket.
+// Handles popup checks, tab spawning, and legacy relay.
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
@@ -12,7 +12,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true; // async
   }
 
-  // Registration relay (content.js calls this directly, but kept for safety)
+  // Registration relay
   if (request.type === "BRIDGE_REGISTER") {
     fetch("http://localhost:3000/register", {
       method: "POST",
@@ -20,6 +20,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       body: JSON.stringify({ url: request.url })
     }).catch(() => {});
     return;
+  }
+
+  // Open a new AI tab (sent from content.js when backend requests it)
+  if (request.type === "OPEN_TAB") {
+    chrome.tabs.create({ url: request.url, active: false }, (tab) => {
+      console.log(`[Open Brain] Opened new tab #${tab.id} → ${request.url}`);
+      sendResponse({ ok: true, tabId: tab.id });
+    });
+    return true; // async
   }
 
 });
